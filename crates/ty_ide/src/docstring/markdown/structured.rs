@@ -6,7 +6,10 @@ use strum::IntoEnumIterator;
 use super::general;
 use crate::docstring::document::SectionKind;
 use crate::docstring::document::preformatted::MarkdownFence;
-use crate::docstring::document::syntax::{is_markdown_code_span, starts_with_markdown_list_item};
+use crate::docstring::document::syntax::{
+    InlineMarkupScanner, InlineMarkupToken, is_rest_role_name, is_wrapped_in_markdown_code_span,
+    starts_with_markdown_list_item,
+};
 
 mod google;
 mod numpy;
@@ -372,12 +375,92 @@ fn description_block_start(description: &str) -> Option<usize> {
 fn render_type_code_span_into(output: &mut String, ty: &str) {
     let normalized = normalize_type_for_code_span(ty);
 
-    if is_markdown_code_span(&normalized) {
+    // Preserve existing code spans, except abbreviated Sphinx references such as
+    // "`~astropy.modeling.core.Model`", which must be normalized to "`Model`".
+    if !normalized.starts_with("`~") && is_wrapped_in_markdown_code_span(&normalized) {
         output.push_str(&normalized);
         return;
     }
 
+    let normalized = normalize_embedded_type_markup(&normalized);
     render_code_span_into(output, normalized.as_ref());
+}
+
+/// Removes markup before wrapping a type in a code span. For example:
+///
+/// ```text
+/// str or :class:`~pkg.Widget` or `pkg.Other` -> str or Widget or pkg.Other
+/// -\|> -> -|>
+/// ```
+fn normalize_embedded_type_markup(ty: &str) -> Cow<'_, str> {
+    if !ty.contains('`') && !ty.contains('\\') {
+        return Cow::Borrowed(ty);
+    }
+
+    let mut normalized = String::with_capacity(ty.len());
+    let mut tokens = InlineMarkupScanner::new(ty).peekable();
+    while let Some(token) = tokens.next() {
+        match token {
+            InlineMarkupToken::Text(text) => {
+                // "str or :class:`Widget`" -> "str or `Widget`".
+                let text_without_role = if matches!(tokens.peek(), Some(InlineMarkupToken::Code(_)))
+                {
+                    strip_rest_role(text).unwrap_or(text)
+                } else {
+                    text
+                };
+                push_unescaped(&mut normalized, text_without_role);
+            }
+            InlineMarkupToken::Code(span) => {
+                let markup = span.content();
+                // "`~pkg.Widget`" -> "Widget"; "``literal`tick``" -> "literal`tick".
+                let display_text = if span.is_single() {
+                    interpreted_text_label(markup)
+                } else {
+                    markup
+                };
+                push_unescaped(&mut normalized, display_text);
+            }
+        }
+    }
+
+    Cow::Owned(normalized)
+}
+
+/// Returns `text` without a trailing reStructuredText role.
+///
+/// `"str or :class:"` becomes `"str or "`.
+fn strip_rest_role(text: &str) -> Option<&str> {
+    let without_closing_colon = text.strip_suffix(':')?;
+
+    // "str or :py:class" -> prefix = "str or ", role_name = "py:class".
+    let prefix = without_closing_colon.trim_end_matches(|character: char| {
+        character.is_alphanumeric() || matches!(character, '-' | '.' | '_' | '+' | ':')
+    });
+    let role_name = without_closing_colon[prefix.len()..].strip_prefix(':')?;
+
+    is_rest_role_name(role_name).then_some(prefix)
+}
+
+/// Returns the abbreviated label from reStructuredText interpreted text prefixed by `~`.
+fn interpreted_text_label(text: &str) -> &str {
+    let Some(target) = text.strip_prefix('~').filter(|target| !target.is_empty()) else {
+        return text;
+    };
+    target.rsplit_once('.').map_or(target, |(_, label)| label)
+}
+
+fn push_unescaped(output: &mut String, text: &str) {
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\\'
+            && let Some(escaped) = characters.next_if(char::is_ascii_punctuation)
+        {
+            output.push(escaped);
+        } else {
+            output.push(character);
+        }
+    }
 }
 
 /// Normalizes type text so it fits in a single Markdown code span.
@@ -600,6 +683,64 @@ mod tests {
 
         **&lt;value&gt; &amp; \[docs\](target) \| \~deleted\~**<HB>
         Escaped name.
+        ");
+    }
+
+    #[test]
+    fn section_items_normalize_source_markup_in_types() {
+        let _snap = bind_markdown_snapshot_filters();
+        let section = section_block(vec![
+            SectionItem::new(
+                SectionKind::Parameters,
+                Some("rng"),
+                Some("{None, int, `numpy.random.Generator`, `numpy.random.RandomState`}, optional"),
+                "Random number generator.",
+            ),
+            SectionItem::new(
+                SectionKind::Parameters,
+                Some("arrowstyle"),
+                Some(r"str (default='-\|>')"),
+                "Arrow style.",
+            ),
+        ]);
+
+        assert_snapshot!(render_markdown(&section), @"
+        ## Parameters
+        **rng**: `{None, int, numpy.random.Generator, numpy.random.RandomState}, optional`<HB>
+        Random number generator.
+
+        **arrowstyle**: `str (default='-|>')`<HB>
+        Arrow style.
+        ");
+    }
+
+    #[test]
+    fn section_items_remove_rest_roles_from_types() {
+        let _snap = bind_markdown_snapshot_filters();
+        let section = section_block(vec![
+            SectionItem::new(
+                SectionKind::Parameters,
+                Some("colormap"),
+                Some(
+                    "str or :class:`~matplotlib.colors.Colormap` or :mod:`matplotlib.colors` or `~pandas.Index`",
+                ),
+                "Color mapping.",
+            ),
+            SectionItem::new(
+                SectionKind::Parameters,
+                Some("model"),
+                Some("`~astropy.modeling.core.Model`"),
+                "Model.",
+            ),
+        ]);
+
+        assert_snapshot!(render_markdown(&section), @"
+        ## Parameters
+        **colormap**: `str or Colormap or matplotlib.colors or Index`<HB>
+        Color mapping.
+
+        **model**: `Model`<HB>
+        Model.
         ");
     }
 
