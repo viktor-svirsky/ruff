@@ -2270,9 +2270,12 @@ impl<'a, 'c, 'db> TypeRelationChecker<'a, 'c, 'db> {
             }
 
             // This branch asks: given two types `type[T]` and `type[S]`, is `type[T]` a subtype of `type[S]`?
-            (Type::SubclassOf(source), Type::SubclassOf(target)) => {
-                self.check_subclassof_pair(db, source, target)
-            }
+            (Type::SubclassOf(source), Type::SubclassOf(target)) => self.with_recursion_guard(
+                db,
+                Type::SubclassOf(source),
+                Type::SubclassOf(target),
+                || self.check_subclassof_pair(db, source, target),
+            ),
 
             // `Literal[str]` is a subtype of `type` because the `str` class object is an instance of its metaclass `type`.
             // `Literal[abc.ABC]` is a subtype of `abc.ABCMeta` because the `abc.ABC` class object

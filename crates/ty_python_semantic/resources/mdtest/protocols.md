@@ -5433,6 +5433,73 @@ def assign(value: Impl[int]) -> Proto[int]:
     return value  # error: [invalid-return-type]
 ```
 
+### Generic aliases implementing recursively-specialized protocols
+
+```toml
+[environment]
+python-version = "3.12"
+```
+
+```py
+from __future__ import annotations
+
+from typing import Protocol
+from ty_extensions._internal import TypeOf
+
+class Impl[T]:
+    child: TypeOf[Impl[list[T]]]
+
+class Proto[T](Protocol):
+    child: Proto[list[T]]
+
+def assign(value: TypeOf[Impl[int]]) -> Proto[int]:
+    return value  # error: [invalid-return-type]
+```
+
+### Subclass-of types implementing recursively-specialized protocols
+
+```toml
+[environment]
+python-version = "3.12"
+```
+
+```py
+from __future__ import annotations
+
+from typing import Protocol
+
+class Impl[T]:
+    child: type[Impl[list[T]]]
+
+class Proto[T](Protocol):
+    child: Proto[list[T]]
+
+def assign(value: type[Impl[int]]) -> Proto[int]:
+    return value  # error: [invalid-return-type]
+```
+
+### Subclass-of types implementing recursively-specialized protocol meta-types
+
+```toml
+[environment]
+python-version = "3.12"
+```
+
+```py
+from __future__ import annotations
+
+from typing import Protocol
+
+class Impl[T]:
+    child: type[Impl[list[T]]]
+
+class Proto[T](Protocol):
+    child: type[Proto[list[T]]]
+
+def assign(value: type[Impl[int]]) -> type[Proto[int]]:
+    return value  # error: [invalid-return-type]
+```
+
 ### Disjointness of recursive protocol and recursive final type
 
 ```py

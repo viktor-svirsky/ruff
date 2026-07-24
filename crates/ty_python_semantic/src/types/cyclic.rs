@@ -37,7 +37,8 @@ use crate::types::generics::Specialization;
 use crate::types::list_members::all_members;
 use crate::types::visitor::{TypeCollector, TypeVisitor, walk_type_with_recursion_guard};
 use crate::types::{
-    ClassType, NominalInstanceType, ProtocolInstanceType, Type, TypeAliasType, TypedDictType,
+    ClassType, GenericAlias, NominalInstanceType, ProtocolInstanceType, SubclassOfInner,
+    SubclassOfType, Type, TypeAliasType, TypedDictType,
 };
 
 /// The type identity used for recursive checks/transformations.
@@ -45,8 +46,10 @@ use crate::types::{
 pub enum TypeIdentity<'db> {
     FunctionLiteral(FunctionLiteral<'db>),
     NewTypeInstance(Definition<'db>),
+    RecursiveGenericAlias(Definition<'db>),
     RecursiveNominalInstance(Definition<'db>),
     RecursiveProtocol(Definition<'db>),
+    RecursiveSubclassOf(Definition<'db>),
     RecursiveTypeAlias(Definition<'db>),
     RecursiveTypedDict(Definition<'db>),
     NonRecursive(Type<'db>),
@@ -71,11 +74,18 @@ impl<'db> Type<'db> {
             (Type::NewTypeInstance(a), Type::NewTypeInstance(b)) => {
                 a.definition(db) == b.definition(db)
             }
+            (Type::GenericAlias(a), Type::GenericAlias(b)) => a.definition(db) == b.definition(db),
             (Type::NominalInstance(a), Type::NominalInstance(b)) => {
                 a.definition(db) == b.definition(db)
             }
             (Type::ProtocolInstance(a), Type::ProtocolInstance(b)) => {
                 a.definition(db) == b.definition(db)
+            }
+            (Type::SubclassOf(a), Type::SubclassOf(b)) => {
+                match (a.definition(db), b.definition(db)) {
+                    (Some(a), Some(b)) => a == b,
+                    _ => false,
+                }
             }
             (Type::TypeAlias(a), Type::TypeAlias(b)) => a.definition(db) == b.definition(db),
             (Type::TypedDict(a), Type::TypedDict(b)) => a.definition(db) == b.definition(db),
@@ -96,6 +106,9 @@ impl<'db> Type<'db> {
             Type::NewTypeInstance(newtype) => {
                 Some(TypeIdentity::NewTypeInstance(newtype.definition(db)))
             }
+            Type::GenericAlias(alias) if alias.is_recursive(db) => {
+                Some(TypeIdentity::RecursiveGenericAlias(alias.definition(db)))
+            }
             Type::NominalInstance(instance) if instance.is_recursive(db) => Some(
                 TypeIdentity::RecursiveNominalInstance(instance.definition(db)?),
             ),
@@ -106,6 +119,9 @@ impl<'db> Type<'db> {
             Type::ProtocolInstance(protocol) if protocol.is_recursive(db) => {
                 Some(TypeIdentity::RecursiveProtocol(protocol.definition(db)?))
             }
+            Type::SubclassOf(subclass_of) if subclass_of.is_recursive(db) => Some(
+                TypeIdentity::RecursiveSubclassOf(subclass_of.definition(db)?),
+            ),
             Type::TypedDict(typed_dict) if typed_dict.is_recursive(db) => {
                 let definition = typed_dict.definition(db)?;
                 Some(TypeIdentity::RecursiveTypedDict(definition))
@@ -117,22 +133,35 @@ impl<'db> Type<'db> {
 
 struct DefinitionReferenceVisitor<'db> {
     target: Definition<'db>,
+    kind: DefinitionReferenceKind,
     active_definitions: ActiveRecursionDetector<Definition<'db>>,
     visited_types: TypeCollector<'db>,
     found: Cell<bool>,
 }
 
+#[derive(Clone, Copy)]
+enum DefinitionReferenceKind {
+    Instance,
+    ClassObject,
+}
+
 impl<'db> DefinitionReferenceVisitor<'db> {
     /// Returns whether the definition represented by `ty` references `target`.
-    fn references(db: &'db dyn Db, ty: Type<'db>, target: Definition<'db>) -> bool {
-        let visitor = Self::new(target);
+    fn references(
+        db: &'db dyn Db,
+        ty: Type<'db>,
+        target: Definition<'db>,
+        kind: DefinitionReferenceKind,
+    ) -> bool {
+        let visitor = Self::new(target, kind);
         visitor.visit_definition_body(db, ty);
         visitor.found.get()
     }
 
-    fn new(target: Definition<'db>) -> Self {
+    fn new(target: Definition<'db>, kind: DefinitionReferenceKind) -> Self {
         Self {
             target,
+            kind,
             active_definitions: ActiveRecursionDetector::default(),
             visited_types: TypeCollector::default(),
             found: Cell::new(false),
@@ -140,6 +169,7 @@ impl<'db> DefinitionReferenceVisitor<'db> {
     }
 
     fn definition_and_specialization(
+        &self,
         db: &'db dyn Db,
         ty: Type<'db>,
     ) -> Option<(Definition<'db>, Option<Specialization<'db>>)> {
@@ -147,11 +177,22 @@ impl<'db> DefinitionReferenceVisitor<'db> {
             return Some((alias.definition(db), alias.specialization(db)));
         }
 
-        let class = match ty {
-            Type::NominalInstance(instance) => instance.class(db),
-            Type::ProtocolInstance(protocol) => *protocol.class_origin()?,
-            Type::TypedDict(typed_dict) => typed_dict.defining_class()?,
-            _ => return None,
+        let class = match self.kind {
+            DefinitionReferenceKind::Instance => match ty {
+                Type::NominalInstance(instance) => instance.class(db),
+                Type::ProtocolInstance(protocol) => *protocol.class_origin()?,
+                Type::TypedDict(typed_dict) => typed_dict.defining_class()?,
+                _ => return None,
+            },
+            DefinitionReferenceKind::ClassObject => match ty {
+                Type::GenericAlias(alias) => ClassType::Generic(alias),
+                Type::SubclassOf(subclass_of) => match subclass_of.subclass_of() {
+                    SubclassOfInner::Class(class) => class,
+                    SubclassOfInner::Protocol(protocol) => *protocol.class_origin()?,
+                    SubclassOfInner::Dynamic(_) | SubclassOfInner::TypeVar(_) => return None,
+                },
+                _ => return None,
+            },
         };
         let definition = class.definition(db)?;
         let specialization = class
@@ -169,10 +210,29 @@ impl<'db> DefinitionReferenceVisitor<'db> {
     fn visit_definition_body(&self, db: &'db dyn Db, ty: Type<'db>) {
         match ty {
             Type::TypeAlias(alias) => self.visit_type_alias_type(db, alias),
+            Type::ClassLiteral(_) | Type::GenericAlias(_) | Type::SubclassOf(_) => {
+                self.visit_class_object_type(db, ty);
+            }
             Type::NominalInstance(instance) => self.visit_nominal_instance_type(db, instance),
             Type::ProtocolInstance(protocol) => self.visit_protocol_instance_type(db, protocol),
             Type::TypedDict(typed_dict) => self.visit_typed_dict_type(db, typed_dict),
             _ => {}
+        }
+    }
+
+    fn visit_class_object_type(&self, db: &'db dyn Db, ty: Type<'db>) {
+        self.visit_members(db, ty);
+    }
+
+    fn visit_members(&self, db: &'db dyn Db, ty: Type<'db>) {
+        let mut members = all_members(db, ty).into_iter().collect::<Vec<_>>();
+        members.sort_unstable();
+        for member in members {
+            match member.ty {
+                // Method relations have a separate declaration-based recursion guard.
+                Type::FunctionLiteral(_) | Type::BoundMethod(_) | Type::KnownBoundMethod(_) => {}
+                ty => self.visit_type(db, ty),
+            }
         }
     }
 }
@@ -187,7 +247,7 @@ impl<'db> TypeVisitor<'db> for DefinitionReferenceVisitor<'db> {
             return;
         }
 
-        if let Some((definition, specialization)) = Self::definition_and_specialization(db, ty) {
+        if let Some((definition, specialization)) = self.definition_and_specialization(db, ty) {
             if definition == self.target {
                 self.found.set(true);
                 return;
@@ -216,17 +276,7 @@ impl<'db> TypeVisitor<'db> for DefinitionReferenceVisitor<'db> {
     }
 
     fn visit_nominal_instance_type(&self, db: &'db dyn Db, nominal: NominalInstanceType<'db>) {
-        let mut members = all_members(db, Type::NominalInstance(nominal))
-            .into_iter()
-            .collect::<Vec<_>>();
-        members.sort_unstable();
-        for member in members {
-            match member.ty {
-                // Method relations have a separate declaration-based recursion guard.
-                Type::FunctionLiteral(_) | Type::BoundMethod(_) | Type::KnownBoundMethod(_) => {}
-                ty => self.visit_type(db, ty),
-            }
-        }
+        self.visit_members(db, Type::NominalInstance(nominal));
     }
 
     fn visit_type_alias_type(&self, db: &'db dyn Db, alias: TypeAliasType<'db>) {
@@ -249,6 +299,19 @@ impl<'db> TypeAliasType<'db> {
             db,
             Type::TypeAlias(self.unspecialized(db)),
             self.definition(db),
+            DefinitionReferenceKind::Instance,
+        )
+    }
+}
+
+impl<'db> GenericAlias<'db> {
+    fn is_recursive(self, db: &'db dyn Db) -> bool {
+        let origin = self.origin(db);
+        DefinitionReferenceVisitor::references(
+            db,
+            Type::ClassLiteral(origin.into()),
+            origin.definition(db),
+            DefinitionReferenceKind::ClassObject,
         )
     }
 }
@@ -268,7 +331,12 @@ impl<'db> NominalInstanceType<'db> {
         };
         let definition = origin.definition(db);
         let unspecialized = Type::instance(db, ClassType::NonGeneric(origin.into()));
-        DefinitionReferenceVisitor::references(db, unspecialized, definition)
+        DefinitionReferenceVisitor::references(
+            db,
+            unspecialized,
+            definition,
+            DefinitionReferenceKind::Instance,
+        )
     }
 }
 
@@ -289,7 +357,48 @@ impl<'db> ProtocolInstanceType<'db> {
         // Inspect the definition without its current specialization. Otherwise, a finite
         // type such as `Protocol[Protocol[int]]` would appear recursive.
         let unspecialized = Type::instance(db, ClassType::NonGeneric(origin.into()));
-        DefinitionReferenceVisitor::references(db, unspecialized, definition)
+        DefinitionReferenceVisitor::references(
+            db,
+            unspecialized,
+            definition,
+            DefinitionReferenceKind::Instance,
+        )
+    }
+}
+
+impl<'db> SubclassOfType<'db> {
+    fn definition(self, db: &'db dyn Db) -> Option<Definition<'db>> {
+        let class = match self.subclass_of() {
+            SubclassOfInner::Class(class) => class,
+            SubclassOfInner::Protocol(protocol) => *protocol.class_origin()?,
+            SubclassOfInner::Dynamic(_) | SubclassOfInner::TypeVar(_) => return None,
+        };
+        class.definition(db)
+    }
+
+    fn is_recursive(self, db: &'db dyn Db) -> bool {
+        let class = match self.subclass_of() {
+            SubclassOfInner::Class(class) => class,
+            SubclassOfInner::Protocol(protocol) => {
+                let Some(class) = protocol.class_origin() else {
+                    return false;
+                };
+                *class
+            }
+            SubclassOfInner::Dynamic(_) | SubclassOfInner::TypeVar(_) => return false,
+        };
+        let Some((origin, _)) = class.static_class_literal(db) else {
+            return false;
+        };
+        let definition = origin.definition(db);
+        let unspecialized =
+            Type::instance(db, ClassType::NonGeneric(origin.into())).to_meta_type(db);
+        DefinitionReferenceVisitor::references(
+            db,
+            unspecialized,
+            definition,
+            DefinitionReferenceKind::ClassObject,
+        )
     }
 }
 
@@ -305,7 +414,12 @@ impl<'db> TypedDictType<'db> {
         // Inspect the definition without its current specialization for the same reason as
         // protocols above.
         let unspecialized = Type::typed_dict(ClassType::NonGeneric(origin.into()));
-        DefinitionReferenceVisitor::references(db, unspecialized, definition)
+        DefinitionReferenceVisitor::references(
+            db,
+            unspecialized,
+            definition,
+            DefinitionReferenceKind::Instance,
+        )
     }
 }
 
